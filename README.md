@@ -2,7 +2,7 @@
 
 Questo script Python analizza i dati esportati da Apple Salute (Health App), focalizzandosi sugli allenamenti (`Workout`) e sui percorsi GPS (`.gpx`), per generare alcune visualizzazioni di base.
 
-**Creato da:** Un Comitato di Esperti Virtuali (con il contributo dell'utente)
+**Creato da:** Me + uso di Gemini
 
 ## Funzionalità Principali
 
