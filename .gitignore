@@ -1,0 +1,28 @@
+# Dati Utente 
+apple_health_export/
+
+# Cache e file compilati Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ambienti Virtuali
+venv/
+env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# File specifici macOS/Windows
+.DS_Store
+Thumbs.db
+
+# File di configurazione IDE (Esempio)
+.vscode/
+.idea/
+
+# Eventuali output o log non necessari
+analysis_output/
+*.log
