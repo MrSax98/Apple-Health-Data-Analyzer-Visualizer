@@ -1,0 +1,327 @@
+# ==============================================================================
+# Script Analisi Dati Apple Health - COMPLETO (v3.0)
+# Obiettivo: Leggere dati Apple Health (export.xml, workout-routes/*.gpx)
+#            dalla sottocartella 'apple_health_export' locale allo script
+#            e visualizzare statistiche allenamenti e mappa+altimetria percorso.
+# ==============================================================================
+
+# --- Importazioni Necessarie ---
+from pathlib import Path
+import os
+import xml.etree.ElementTree as ET
+import pandas as pd
+import warnings
+import gpxpy
+import gpxpy.gpx
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import numpy as np
+
+# Ignora avvisi specifici di pandas
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+# Imposta lo stile grafico
+plt.style.use('ggplot')
+
+# ==============================================================================
+# --- Funzioni Definite ---
+# ==============================================================================
+
+# --- Funzione Helper per Distanza ---
+def calculate_haversine(lat1, lon1, lat2, lon2):
+    """Calcola la distanza (in km) tra due punti GPS usando la formula Haversine."""
+    R = 6371
+    try:
+        if not isinstance(lat1, (int, float)) or not isinstance(lon1, (int, float)) or \
+           not isinstance(lat2, (int, float)) or not isinstance(lon2, (int, float)):
+            return 0.0
+        lat1_rad, lon1_rad = np.radians(lat1), np.radians(lon1)
+        lat2_rad, lon2_rad = np.radians(lat2), np.radians(lon2)
+        dlon = lon2_rad - lon1_rad
+        dlat = lat2_rad - lat1_rad
+        a = np.sin(dlat / 2)**2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon / 2)**2
+        c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+        distance = R * c
+        return distance
+    except Exception:
+        return 0.0
+
+# --- Funzione di Parsing XML ---
+def parse_workouts_from_xml(xml_path):
+    """Estrae gli allenamenti da export.xml e li mette in un DataFrame pandas."""
+    workouts_data = []
+    print(f"\nInizio parsing di {xml_path.name}...")
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        for workout in root.findall('.//Workout'):
+            data = workout.attrib.copy()
+            for meta in workout.findall('.//MetadataEntry'):
+                key = meta.attrib['key'].replace('HK', '')
+                value = meta.attrib['value']
+                data[key] = value
+            workouts_data.append(data)
+        print(f"Trovati e processati {len(workouts_data)} elementi Workout.")
+    except FileNotFoundError:
+        print(f"ERRORE CRITICO: File {xml_path.name} non trovato!")
+        return None
+    except ET.ParseError as e:
+        print(f"ERRORE: Parsing XML fallito: {xml_path}. Dettagli: {e}")
+        return None
+    except Exception as e:
+        print(f"ERRORE inaspettato durante il parsing XML: {e}")
+        return None
+
+    if not workouts_data:
+        print("Nessun dato Workout trovato nel file XML.")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(workouts_data)
+    print(f"DataFrame grezzo creato con {df.shape[0]} righe e {df.shape[1]} colonne.")
+    print("Esecuzione pulizia dati e conversione tipi...")
+    # ... (Stessa logica di pulizia della versione precedente) ...
+    date_cols = ['creationDate', 'startDate', 'endDate']
+    numeric_cols = ['duration', 'totalDistance', 'totalEnergyBurned']
+    for col in date_cols:
+        if col in df.columns: df[col] = pd.to_datetime(df[col], errors='coerce')
+    for col in numeric_cols:
+         if col in df.columns:
+            if df[col].dtype == 'object': df[col] = df[col].astype(str).str.extract(r'(\d+\.?\d*)', expand=False)
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    if 'workoutActivityType' in df.columns: df['workoutActivityType'] = df['workoutActivityType'].str.replace('HKWorkoutActivityType', '')
+    df.rename(columns={'workoutActivityType': 'TipoAllenamento','duration': 'DurataMin','totalDistance': 'DistanzaKm','totalEnergyBurned': 'CalorieKcal','startDate': 'DataInizio','endDate': 'DataFine'}, inplace=True, errors='ignore')
+    if 'durationUnit' in df.columns and 'DurataMin' in df.columns:
+        try:
+            mask_sec = df['durationUnit'] == 'sec'
+            df.loc[mask_sec, 'DurataMin'] = df.loc[mask_sec, 'DurataMin'] / 60.0
+            print("  - Durata convertita da secondi a minuti dove necessario.")
+        except Exception as e: print(f"  - Attenzione: problema durante conversione unità durata: {e}")
+    print("Pulizia dati completata.")
+    return df.sort_values(by='DataInizio').reset_index(drop=True)
+
+
+# --- Funzioni di Parsing GPX ---
+def parse_gpx_file(gpx_path):
+    """Estrae i punti da un singolo file GPX."""
+    points = []
+    try:
+        with open(gpx_path, 'r', encoding='utf-8') as gpx_file:
+            gpx = gpxpy.parse(gpx_file)
+            # ... (Stessa logica di parsing GPX della versione precedente) ...
+            for track in gpx.tracks:
+                for segment in track.segments:
+                    for point in segment.points:
+                        points.append({'latitude': point.latitude,'longitude': point.longitude,'elevation': point.elevation,'time': point.time})
+    except FileNotFoundError: print(f"ERRORE: File GPX non trovato (parsing): {gpx_path}"); return None
+    except gpxpy.gpx.GPXXMLSyntaxException as e: print(f"ERRORE Sintassi XML GPX {gpx_path.name}: {e}"); return None
+    except Exception as e: print(f"ERRORE inaspettato parsing GPX {gpx_path.name}: {e}"); return None
+    if not points: return pd.DataFrame()
+    df = pd.DataFrame(points)
+    if 'time' in df.columns:
+        if df['time'].dt.tz is None: df['time'] = pd.to_datetime(df['time'], errors='coerce', utc=True)
+        else: df['time'] = pd.to_datetime(df['time'], errors='coerce')
+    if 'elevation' not in df.columns: df['elevation'] = 0.0
+    df['elevation'] = pd.to_numeric(df['elevation'], errors='coerce').fillna(0.0)
+    return df
+
+def parse_all_gpx_routes(routes_folder_path):
+    """Trova e parsa tutti i file GPX in una cartella."""
+    all_routes_data = {}
+    if not routes_folder_path.exists() or not routes_folder_path.is_dir():
+        # L'errore viene gestito prima della chiamata, ma per sicurezza
+        print(f"ERRORE: La cartella percorsi GPX non è valida: {routes_folder_path}")
+        return all_routes_data
+    # ... (Stessa logica di ricerca e parsing GPX della versione precedente) ...
+    gpx_files = list(routes_folder_path.glob('*.gpx')) + list(routes_folder_path.glob('*.GPX'))
+    print(f"Trovati {len(gpx_files)} potenziali file GPX in '{routes_folder_path.name}'.")
+    parsed_count = 0
+    failed_files = []
+    for gpx_file_path in gpx_files:
+        route_df = parse_gpx_file(gpx_file_path)
+        if route_df is not None and not route_df.empty:
+            route_key = gpx_file_path.stem
+            all_routes_data[route_key] = route_df
+            parsed_count += 1
+        elif route_df is None:
+             failed_files.append(gpx_file_path.name)
+    print(f"Parsati con successo {parsed_count} file GPX.")
+    if failed_files: print(f"ATTENZIONE: Impossibile parsare i seguenti file GPX: {failed_files}")
+    return all_routes_data
+
+
+# --- Funzioni di Visualizzazione (Migliorate) ---
+def plot_workout_types(df_workouts):
+    """Grafico a barre orizzontale migliorato dei tipi di allenamento."""
+    print("Generazione grafico: Tipi di Allenamento...")
+    # ... (Stessa funzione di plot migliorata della versione precedente) ...
+    colonna_tipo = 'TipoAllenamento'
+    if df_workouts is None or df_workouts.empty or colonna_tipo not in df_workouts.columns: print("  - Dati allenamenti mancanti. Grafico saltato."); return
+    try:
+        workout_counts = df_workouts[colonna_tipo].value_counts().nlargest(15).sort_values()
+        if workout_counts.empty: print("  - Nessun dato TipoAllenamento. Grafico saltato."); return
+        fig, ax = plt.subplots(figsize=(11, 8))
+        colors = plt.cm.viridis(np.linspace(0.4, 0.9, len(workout_counts)))
+        bars = ax.barh(workout_counts.index, workout_counts.values, color=colors)
+        ax.bar_label(bars, padding=3, fontsize=9)
+        ax.set_title('Tipi di Allenamento Più Frequenti (Top 15)', fontsize=14); ax.set_xlabel('Numero di Sessioni', fontsize=11); ax.set_ylabel('Tipo di Allenamento', fontsize=11)
+        ax.margins(x=0.1); plt.tight_layout(); print("  - Grafico Tipi di Allenamento creato.")
+    except Exception as e: print(f"  - ERRORE creazione grafico Tipi Allenamento: {e}")
+
+def plot_workout_duration_over_time(df_workouts):
+    """Grafico a dispersione durata vs tempo, colorato per tipo allenamento."""
+    print("Generazione grafico: Durata vs Tempo per Tipo...")
+    # ... (Stessa funzione di plot migliorata della versione precedente) ...
+    colonna_data = 'DataInizio'; colonna_durata = 'DurataMin'; colonna_tipo = 'TipoAllenamento'
+    if df_workouts is None or df_workouts.empty or not all(c in df_workouts.columns for c in [colonna_data, colonna_durata, colonna_tipo]): print("  - Dati allenamenti mancanti. Grafico saltato."); return
+    df_plot = df_workouts.dropna(subset=[colonna_data, colonna_durata, colonna_tipo])
+    if df_plot.empty: print(f"  - Nessun dato valido {colonna_data}/{colonna_durata}/{colonna_tipo}. Grafico saltato."); return
+    try:
+        top_types = df_plot[colonna_tipo].value_counts().nlargest(7).index.tolist()
+        df_plot['TipoPlot'] = df_plot[colonna_tipo].apply(lambda x: x if x in top_types else 'Other')
+        plot_types_ordered = top_types + ['Other'] if 'Other' in df_plot['TipoPlot'].unique() else top_types
+        colors = plt.get_cmap('tab10'); color_map = {tipo: colors(i % 10) for i, tipo in enumerate(plot_types_ordered)}
+        plt.figure(figsize=(15, 8))
+        for i, tipo in enumerate(plot_types_ordered):
+            subset = df_plot[df_plot['TipoPlot'] == tipo]
+            if not subset.empty: plt.scatter(subset[colonna_data], subset[colonna_durata], label=tipo, alpha=0.7, s=30, color=color_map[tipo])
+        plt.title('Durata Allenamenti nel Tempo per Tipo (Top 7 + Other)', fontsize=14); plt.xlabel('Data', fontsize=11); plt.ylabel('Durata (minuti)', fontsize=11)
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%d-%m-%Y')); plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator(minticks=6, maxticks=12))
+        plt.gcf().autofmt_xdate(rotation=45); plt.grid(True, linestyle='--', alpha=0.5)
+        plt.legend(title='Tipo Allenamento', bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=9); plt.tight_layout(rect=[0, 0, 0.88, 1])
+        print("  - Grafico Durata vs Tempo per Tipo creato.")
+    except Exception as e: print(f"  - ERRORE creazione grafico Durata vs Tempo: {e}")
+
+def plot_gpx_route(df_route, route_name="Percorso Allenamento"):
+    """Visualizza mappa percorso GPX e profilo altimetrico."""
+    print(f"Generazione grafico: Mappa e Altimetria Percorso '{route_name}'...")
+    # ... (Stessa funzione di plot migliorata della versione precedente) ...
+    cols_needed = ['latitude', 'longitude', 'elevation', 'time']
+    if df_route is None or df_route.empty or not all(c in df_route.columns for c in cols_needed): print(f"  - Dati GPX incompleti per '{route_name}'. Grafico saltato."); return
+    try:
+        df_route = df_route.sort_values(by='time').reset_index(drop=True); df_route = df_route.dropna(subset=['latitude', 'longitude', 'elevation'])
+        if len(df_route) < 2: print(f"  - Dati GPX insuff. (meno di 2 punti) per '{route_name}'. Grafico saltato."); return
+        distances = [0.0]
+        for i in range(1, len(df_route)): distances.append(distances[-1] + calculate_haversine(df_route['latitude'].iloc[i-1], df_route['longitude'].iloc[i-1], df_route['latitude'].iloc[i], df_route['longitude'].iloc[i]))
+        df_route['cumulative_distance_km'] = distances; total_distance = df_route['cumulative_distance_km'].iloc[-1]
+        fig, axs = plt.subplots(2, 1, figsize=(10, 10), sharex=False, gridspec_kw={'height_ratios': [3, 1]}); fig.suptitle(f'Percorso e Altimetria: {route_name}', fontsize=16)
+        ax_map = axs[0]; ax_map.plot(df_route['longitude'], df_route['latitude'], color='dodgerblue', linewidth=2, label='Percorso')
+        ax_map.plot(df_route['longitude'].iloc[0], df_route['latitude'].iloc[0], 'o', color='lime', markersize=8, label='Inizio', zorder=5)
+        ax_map.plot(df_route['longitude'].iloc[-1], df_route['latitude'].iloc[-1], 'o', color='red', markersize=8, label='Fine', zorder=5)
+        ax_map.set_xlabel('Longitudine', fontsize=10); ax_map.set_ylabel('Latitudine', fontsize=10); ax_map.set_title('Mappa Percorso', fontsize=12)
+        ax_map.axis('equal'); ax_map.grid(True, linestyle=':', alpha=0.7); ax_map.legend(fontsize=9)
+        ax_ele = axs[1]; ax_ele.plot(df_route['cumulative_distance_km'], df_route['elevation'], color=' Sostituisc', linewidth=1.5, label='Altimetria')
+        ax_ele.fill_between(df_route['cumulative_distance_km'], df_route['elevation'], alpha=0.2, color=' Sostituisc')
+        ax_ele.set_xlabel('Distanza Cumulativa (km)', fontsize=10); ax_ele.set_ylabel('Altitudine (m)', fontsize=10); ax_ele.set_title('Profilo Altimetrico', fontsize=12)
+        ax_ele.grid(True, linestyle=':', alpha=0.7); ax_ele.set_xlim(0, total_distance if total_distance > 0 else 1)
+        min_ele, max_ele = df_route['elevation'].min(), df_route['elevation'].max(); padding = (max_ele - min_ele) * 0.1; ax_ele.set_ylim(min_ele - padding, max_ele + padding)
+        fig.tight_layout(rect=[0, 0.03, 1, 0.95]); print(f"  - Grafico Mappa e Altimetria Percorso '{route_name}' creato.")
+    except Exception as e: print(f"  - ERRORE creazione grafico Mappa/Altimetria '{route_name}': {e}")
+
+
+# ==============================================================================
+# --- ESECUZIONE PRINCIPALE DELLO SCRIPT ---
+# ==============================================================================
+
+print("--- Avvio Script Analisi Apple Health (v3.0 - GitHub Ready) ---")
+
+# --- Configurazione Percorsi Relativi ---
+# Nome della sottocartella attesa contenente i dati (export.xml, workout-routes/)
+DATA_SUBFOLDER_NAME = "apple_health_export"
+
+# Ottieni la directory in cui si trova lo script corrente
+# Path(__file__) si riferisce al file script corrente
+# .parent ottiene la directory che lo contiene
+# .resolve() ottiene il percorso assoluto completo (più robusto)
+try:
+    SCRIPT_DIR = Path(__file__).parent.resolve()
+except NameError:
+     # Fallback se __file__ non è definito (es. eseguendo in certi REPL/notebook)
+     SCRIPT_DIR = Path('.').resolve() # Usa la directory di lavoro corrente
+
+# Costruisce il percorso alla SOTTOCARTELLA dei dati RELATIVO allo script
+DATA_FOLDER_PATH = SCRIPT_DIR / DATA_SUBFOLDER_NAME
+
+# Definisce i percorsi ai file/cartelle DATI *all'interno* della SOTTOCARTELLA
+EXPORT_XML_PATH = DATA_FOLDER_PATH / "export.xml"
+WORKOUT_ROUTES_PATH = DATA_FOLDER_PATH / "workout-routes"
+
+print(f"\nDirectory dello script: {SCRIPT_DIR}")
+print(f"Percorso atteso per la cartella dati '{DATA_SUBFOLDER_NAME}': {DATA_FOLDER_PATH}")
+
+# --- Verifica Esistenza Cartella Dati ---
+data_folder_ok = False
+xml_exists = False
+gpx_folder_exists = False
+df_workouts = None
+gpx_data_dict = None
+
+print(f"\n--- Fase 1 & 2: Verifica Percorsi Relativi ---")
+if DATA_FOLDER_PATH.exists() and DATA_FOLDER_PATH.is_dir():
+    print(f"OK: Trovata la cartella dati '{DATA_SUBFOLDER_NAME}' in {SCRIPT_DIR}")
+    data_folder_ok = True
+
+    print(f"\nControllo file/cartelle chiave in '{DATA_SUBFOLDER_NAME}':")
+    print(f" File XML: {EXPORT_XML_PATH}")
+    xml_exists = EXPORT_XML_PATH.exists() and EXPORT_XML_PATH.is_file()
+    print(f"  -> Esiste ed è un file? {xml_exists}")
+
+    print(f" Cartella GPX: {WORKOUT_ROUTES_PATH}")
+    gpx_folder_exists = WORKOUT_ROUTES_PATH.exists() and WORKOUT_ROUTES_PATH.is_dir()
+    print(f"  -> Esiste ed è una cartella? {gpx_folder_exists}")
+
+else:
+    print(f"\nERRORE: Cartella dati '{DATA_SUBFOLDER_NAME}' NON trovata nella directory dello script ({SCRIPT_DIR}).")
+    print(f"Assicurati che la cartella esportata da Apple Salute sia presente qui e si chiami '{DATA_SUBFOLDER_NAME}'.")
+    # Lo script termina qui se non trova la cartella dati principale
+
+# --- Parsing Dati (Solo se la cartella dati esiste) ---
+if data_folder_ok:
+    # --- Parsing XML (Fase 3) ---
+    if xml_exists:
+        df_workouts = parse_workouts_from_xml(EXPORT_XML_PATH)
+    else:
+        print(f"\nATTENZIONE: File '{EXPORT_XML_PATH.name}' non trovato. Parsing XML saltato.")
+
+    # --- Parsing GPX (Fase 4) ---
+    if gpx_folder_exists:
+        gpx_data_dict = parse_all_gpx_routes(WORKOUT_ROUTES_PATH)
+    else:
+         print(f"\nATTENZIONE: Cartella '{WORKOUT_ROUTES_PATH.name}' non trovata. Parsing GPX saltato.")
+
+    # --- Visualizzazione (Fase 5 - Revisionata) ---
+    print("\n--- Fase 5: Generazione Visualizzazioni ---")
+    plots_generated = False
+
+    if df_workouts is not None and not df_workouts.empty:
+        plot_workout_types(df_workouts)
+        plot_workout_duration_over_time(df_workouts)
+        plots_generated = True
+    else:
+        print("Dati Allenamenti non disponibili, grafici relativi saltati.")
+
+    if gpx_data_dict:
+        try:
+            first_route_name = list(gpx_data_dict.keys())[0]
+            first_route_df = gpx_data_dict[first_route_name]
+            plot_gpx_route(first_route_df, route_name=first_route_name)
+            plots_generated = True
+        except IndexError:
+            print("ATTENZIONE: Dizionario GPX non vuoto, ma impossibile ottenere il primo elemento.")
+        except Exception as e:
+            print(f"ERRORE plotting primo percorso GPX: {e}")
+    else:
+        print("Dati Percorsi GPX non disponibili o vuoti, grafico mappa saltato.")
+
+    # Mostra grafici solo se ne è stato generato almeno uno
+    if plots_generated:
+         print("\nVisualizzazione grafici in corso... Chiudi le finestre dei grafici per terminare.")
+         plt.show()
+    else:
+         print("\nNessun grafico generato.")
+
+else:
+     # Messaggio se la cartella dati non è stata trovata all'inizio
+     print("\nEsecuzione interrotta perché la cartella dati non è stata trovata.")
+
+
+print("\n--- Script Terminato ---")
