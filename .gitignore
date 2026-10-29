@@ -26,3 +26,6 @@ Thumbs.db
 # Eventuali output o log non necessari
 analysis_output/
 *.log
+
+# Test
+.pytest_cache/
